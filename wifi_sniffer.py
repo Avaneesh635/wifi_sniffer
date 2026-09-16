@@ -307,26 +307,27 @@ class Sniffer:
             )
 
     def _decrypt_report(self) -> None:
-        """Final verdict per watched SSID based on verification results."""
+        """
+        Final verdict per watched SSID. Results are attributed to the
+        BSSID they were verified against, so with multiple --decrypt
+        networks one network's MIC mismatch never taints another's.
+        """
         if not self.decrypt_ssids:
             return
         for ssid in self.decrypt_ssids:
-            results = [ok for (ap, sta), ok in self._decrypt_done.items() if ok]
-            checked = self._decrypt_done
-            watched = [k for k in checked if k[0] in self.db_summary_bssids(ssid)]
-            correct = any(ok for (ap, sta), ok in checked.items() if ok)
-            mismatch = any(not ok for (ap, sta), ok in checked.items() if not ok)
-            del results, watched  # only the aggregate flags matter here
-            if correct:
+            results = []
+            for (ap_mac, _sta), ok in self._decrypt_done.items():
+                ap = self.db.get_ap(ap_mac)
+                if ap is not None and ap.ssid == ssid:
+                    results.append(ok)
+            if not results:
+                print(f"[=] '{ssid}': no matching M1+M2 captured -- inconclusive")
+            elif all(results):
                 print(f"[=] '{ssid}': passphrase CONFIRMED by captured handshake")
-            elif mismatch:
+            elif not any(results):
                 print(f"[=] '{ssid}': passphrase appears INCORRECT (MIC mismatch)")
             else:
-                print(f"[=] '{ssid}': no matching M1+M2 captured -- inconclusive")
-
-    def db_summary_bssids(self, ssid: str):
-        """BSSIDs currently known for an SSID (empty set if unknown)."""
-        return {ap.bssid for ap in self.db.aps() if ap.ssid == ssid}
+                print(f"[=] '{ssid}': mixed results -- passphrase appears INCORRECT")
 
 
 def parse_args(argv=None):
