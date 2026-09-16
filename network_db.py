@@ -2,11 +2,11 @@
 """
 network_db.py
 
-Thread-safe in-memory database that tracks the access points and
-clients discovered while sniffing.
+Thread-safe in-memory database that tracks the access points, clients
+and WPA handshakes discovered while sniffing.
 
 Part 1 of the wifi_sniffer upgrade:
-  1. network_db.py      <- this file (AP/client tracking)
+  1. network_db.py      <- this file (AP/client/handshake tracking)
   2. channel_hopper.py  (background channel hopping thread)
   3. packet_parsers.py  (advanced 802.11 parsing)
   4. wifi_sniffer.py    (rewritten main program)
@@ -16,7 +16,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 
 def _now() -> float:
@@ -31,6 +31,13 @@ def _fmt_age(ts: float) -> str:
     if delta < 3600:
         return f"{delta // 60}m{delta % 60:02d}s"
     return f"{delta // 3600}h{(delta % 3600) // 60:02d}m"
+
+
+def _b2h(data) -> object:
+    """Bytes -> hex string for JSON export (anything else passes through)."""
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data).hex()
+    return data
 
 
 def vendor_for_mac(mac: str) -> str:
@@ -152,13 +159,72 @@ class Client:
         }
 
 
+@dataclass
+class Handshake:
+    """
+    Captured EAPOL-Key messages (M1..M4) for one AP/client pair.
+
+    'crackable' means M1+M2 are present: the ANonce (M1) plus SNonce and
+    MIC (M2) are enough to verify a candidate PSK via MIC comparison.
+    """
+
+    bssid: str
+    client: str
+    messages: List[Dict] = field(default_factory=list)
+    first_seen: float = field(default_factory=_now)
+    last_seen: float = field(default_factory=_now)
+
+    @property
+    def messages_seen(self) -> Set[str]:
+        return {m.get("key_msg") for m in self.messages} - {None}
+
+    @property
+    def complete(self) -> bool:
+        """All four handshake messages captured."""
+        return {"M1", "M2", "M3", "M4"} <= self.messages_seen
+
+    @property
+    def crackable(self) -> bool:
+        """M1+M2 captured: enough to test a PSK against the M2 MIC."""
+        return {"M1", "M2"} <= self.messages_seen
+
+    def record(self, fields: Dict) -> bool:
+        """
+        Append one parsed EAPOL-Key message.
+        Returns False (and changes nothing) for a replayed message.
+        """
+        for old in self.messages:
+            if (old.get("replay_counter") == fields.get("replay_counter")
+                    and old.get("key_msg") == fields.get("key_msg")):
+                self.last_seen = _now()
+                return False
+        self.messages.append(fields)
+        self.last_seen = _now()
+        return True
+
+    def to_dict(self) -> dict:
+        return {
+            "bssid": self.bssid,
+            "client": self.client,
+            "complete": self.complete,
+            "crackable": self.crackable,
+            "messages_seen": sorted(self.messages_seen),
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "messages": [
+                {k: _b2h(v) for k, v in msg.items()} for msg in self.messages
+            ],
+        }
+
+
 class NetworkDatabase:
-    """Thread-safe store of all APs and clients seen during a capture."""
+    """Thread-safe store of all APs, clients and handshakes seen."""
 
     def __init__(self, stale_after: float = 300.0):
         self._lock = threading.RLock()
         self._aps: Dict[str, AccessPoint] = {}
         self._clients: Dict[str, Client] = {}
+        self._handshakes: Dict[str, Handshake] = {}
         self.stale_after = stale_after
 
     # ------------------------------------------------------------------ APs
@@ -259,10 +325,44 @@ class NetworkDatabase:
         with self._lock:
             return sorted(self._clients.values(), key=lambda c: c.last_seen, reverse=True)
 
+    # ----------------------------------------------------------- handshakes
+
+    def record_eapol(
+        self, bssid: Optional[str], client: Optional[str], fields: Dict
+    ) -> Tuple[Handshake, bool]:
+        """
+        Store one parsed EAPOL-Key message (from packet_parsers
+        eapol_key_fields()) for the given AP/client pair.
+        Returns (handshake, added) where added is False for replays.
+        """
+        bssid = (bssid or "unknown").lower()
+        client = (client or "unknown").lower()
+        with self._lock:
+            key = f"{bssid}|{client}"
+            hs = self._handshakes.get(key)
+            if hs is None:
+                hs = Handshake(bssid=bssid, client=client)
+                self._handshakes[key] = hs
+            added = hs.record(fields)
+            return hs, added
+
+    def get_handshake(self, bssid: str, client: str) -> Optional[Handshake]:
+        with self._lock:
+            return self._handshakes.get(f"{bssid.lower()}|{client.lower()}")
+
+    def handshakes(self) -> List[Handshake]:
+        with self._lock:
+            return sorted(self._handshakes.values(),
+                          key=lambda h: h.last_seen, reverse=True)
+
     # -------------------------------------------------------------- utility
 
     def prune(self) -> None:
-        """Drop entries that have not been seen for `stale_after` seconds."""
+        """
+        Drop AP/client entries that have not been seen for
+        `stale_after` seconds. Captured handshakes are never pruned:
+        they are small and valuable for later decryption.
+        """
         cutoff = _now() - self.stale_after
         with self._lock:
             for mac in [m for m, c in self._clients.items() if c.last_seen < cutoff]:
@@ -276,7 +376,9 @@ class NetworkDatabase:
                 "generated": _now(),
                 "ap_count": len(self._aps),
                 "client_count": len(self._clients),
+                "handshake_count": len(self._handshakes),
                 "aps": [ap.to_dict() for ap in self.aps()],
+                "handshakes": [hs.to_dict() for hs in self.handshakes()],
             }
         return json.dumps(payload, indent=indent)
 
@@ -286,7 +388,8 @@ class NetworkDatabase:
             lines = [
                 "",
                 f"=== Networks seen: {len(self._aps)} | "
-                f"Clients seen: {len(self._clients)} ===",
+                f"Clients seen: {len(self._clients)} | "
+                f"Handshakes: {len(self._handshakes)} ===",
             ]
             for ap in self.aps():
                 sig = ap.signal_avg
@@ -306,4 +409,19 @@ class NetworkDatabase:
                 for client in probing:
                     ssids = ", ".join(sorted(client.probe_ssids)) or "<broadcast probe>"
                     lines.append(f"{client.mac}  probing for: {ssids}")
+
+            hss = self.handshakes()
+            if hss:
+                lines.append("--- WPA handshakes captured ---")
+                for hs in hss:
+                    if hs.complete:
+                        state = "COMPLETE"
+                    elif hs.crackable:
+                        state = "M1+M2 (crackable)"
+                    else:
+                        state = "/".join(sorted(hs.messages_seen)) or "?"
+                    lines.append(
+                        f"{hs.bssid} <-> {hs.client}  {state}  "
+                        f"({len(hs.messages)} msgs, last {_fmt_age(hs.last_seen)} ago)"
+                    )
             return "\n".join(lines)
