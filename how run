@@ -1,0 +1,73 @@
+No code changes needed — here are the preparation steps only, before running the app:
+
+
+Steps before running
+
+1. Check your WiFi adapter supports monitor mode
+
+ • You need an adapter with a monitor-mode-capable chipset (e.g., Alfa AWUS036ACH, TP-Link TL-WN722N v1).
+ • Most built-in laptop cards have limited support.
+
+2. Use Linux with root access
+
+ • Kali Linux, Parrot OS, or Ubuntu work best.
+ • You must be able to run commands with sudo.
+
+3. Install the dependencies
+
+
+sudo apt update
+
+sudo apt install iw aircrack-ng
+
+pip3 install scapy
+
+
+ • iw — used by the channel hopper
+ • aircrack-ng — provides airmon-ng for monitor mode setup
+ • scapy — the packet capture/parsing library
+
+4. Kill processes that interfere with the WiFi card
+
+
+sudo airmon-ng check kill
+
+
+⚠️ This disconnects you from the internet (kills NetworkManager) — that's normal.
+
+5. Put the adapter into monitor mode
+
+
+sudo airmon-ng start wlan0
+
+
+ • This creates a new interface, usually named wlan0mon.
+ • Verify it exists with: iw dev (look for Interface wlan0mon and type monitor).
+
+6. Confirm the interface name
+
+ • Note the monitor interface name (e.g., wlan0mon) — you'll pass it with -i when running.
+
+7. (Optional) If you built the executable
+
+ • Build it on the same OS you plan to run it on: python3 build_exe.py
+ • The output lands in dist/wifi_sniffer (Linux) or dist/wifi_sniffer.exe (Windows).
+
+8. (Optional) Run the self-test first
+
+
+python3 wifi_sniffer_app.py --self-test
+
+
+ • Confirms the crypto core works before you go live.
+
+Once these are done, you're ready to run:
+
+
+sudo python3 wifi_sniffer_app.py -i wlan0mon
+
+
+Let me know when you're ready for the run-time steps or want any code changes.
+
+
+Tokens: 27k sent, 483 received.
