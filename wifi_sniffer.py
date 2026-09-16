@@ -3,7 +3,7 @@
 wifi_sniffer.py
 
 Main program for the WiFi sniffer. Wires together:
-  - network_db.NetworkDatabase   (AP/client tracking)
+  - network_db.NetworkDatabase   (AP/client/handshake tracking)
   - channel_hopper.ChannelHopper (background channel hopping)
   - packet_parsers               (802.11 frame parsing)
 
@@ -11,20 +11,22 @@ Usage (requires root + a monitor-mode interface):
   sudo python3 wifi_sniffer.py -i wlan0mon
   sudo python3 wifi_sniffer.py -i wlan0mon --no-hop --channels 6
   sudo python3 wifi_sniffer.py -i wlan0mon --json out.json --timeout 120
+
+Captures WPA 4-way handshake messages (M1..M4) per AP/client pair and
+reports progress live; live PSK verification (--decrypt) is planned as
+the final part of the upgrade.
 """
 
 import argparse
-import json
 import signal
 import sys
 import threading
-import time
 
-from scapy.all import Dot11, sniff
+from scapy.all import sniff
 
 from channel_hopper import ChannelHopper
 from network_db import NetworkDatabase
-from packet_parsers import classify, extract_frame_info
+from packet_parsers import extract_frame_info
 
 
 class Sniffer:
@@ -38,6 +40,7 @@ class Sniffer:
         self.eapol_count = 0
         self.deauth_count = 0
         self.packet_count = 0
+        self._handshake_alerted = set()  # (bssid, sta) pairs already announced
 
     # ------------------------------------------------------------ capture
 
@@ -78,10 +81,13 @@ class Sniffer:
                 self.db.update_client(src, signal=rssi, probe_ssid=info["ssid"] or "")
 
         elif kind in ("data", "eapol"):
-            self._track_data(info, kind)
+            self._track_data(info)
             if kind == "eapol":
                 self.eapol_count += 1
-                print(f"[+] EAPOL: {info['eapol']}")
+                if info["eapol_key"]:
+                    self._record_handshake(info)
+                elif info["eapol"]:
+                    print(f"[+] EAPOL: {info['eapol']}")
 
         elif kind == "deauth":
             self.deauth_count += 1
@@ -90,36 +96,60 @@ class Sniffer:
                 f"(reason {info['reason']})"
             )
 
-    def _track_data(self, info: dict, kind: str) -> None:
-        """Attribute data/EAPOL frames to the client and its AP."""
-        addr1 = (info["addr1"] or "").lower()
-        addr2 = (info["addr2"] or "").lower()
-        addr3 = (info["addr3"] or "").lower()
-        if not addr2:
+    def _track_data(self, info: dict) -> None:
+        """
+        Attribute a data/EAPOL frame to its client and AP using the real
+        to-DS / from-DS bits resolved by packet_parsers.endpoints_for_data().
+        """
+        ap_mac = (info["ap"] or "").lower() or None
+        sta_mac = (info["sta"] or "").lower() or None
+        if not sta_mac:
             return
 
-        ap = self.db.get_ap(addr3) or self.db.get_ap(addr1)
-        client_bssid = ap.bssid if ap else None
+        # Only link the client to an AP we have actually confirmed exists
+        # (seen in a beacon / probe response); otherwise keep it standalone.
+        known_ap = ap_mac if (ap_mac and self.db.get_ap(ap_mac)) else None
 
-        # to-DS (STA->AP): addr1 is the AP. from-DS: addr2 is the AP.
-        to_ds = False
-        fc = getattr(info, "get", None)
-        if info["type"] == "data" and kind != "eapol":
-            # We cannot see flags here; guess via db membership.
-            to_ds = self.db.get_ap(addr1) is not None
-        ap_mac = addr1 if to_ds else (addr3 or addr2)
-        if self.db.get_ap(ap_mac):
-            client_bssid = ap_mac
-
-        self.db.update_client(addr2, bssid=client_bssid, signal=rssi := info["rssi"])
-        if client_bssid:
+        self.db.update_client(sta_mac, bssid=known_ap, signal=info["rssi"])
+        if known_ap:
             self.db.update_ap(
-                client_bssid,
+                known_ap,
                 channel=info["channel"],
-                frequency=freq,
-                signal=rssi,
+                frequency=info["frequency"],
+                signal=info["rssi"],
                 is_data=True,
             )
+
+    def _record_handshake(self, info: dict) -> None:
+        """File one EAPOL-Key message into the DB and report progress."""
+        key_fields = info["eapol_key"]
+        ap_mac = (info["ap"] or "unknown").lower()
+        sta_mac = (info["sta"] or "unknown").lower()
+
+        hs, added = self.db.record_eapol(ap_mac, sta_mac, key_fields)
+        if not added:
+            return  # replayed message: already stored, nothing to report
+
+        msg = key_fields.get("key_msg") or "?"
+        ap = self.db.get_ap(ap_mac)
+        ssid = ""
+        if ap and ap.ssid and ap.ssid != "<hidden>":
+            ssid = f" '{ap.ssid}'"
+
+        if hs.complete:
+            if (ap_mac, sta_mac) not in self._handshake_alerted:
+                self._handshake_alerted.add((ap_mac, sta_mac))
+                print(
+                    f"[+] FULL 4-WAY HANDSHAKE captured: "
+                    f"{ap_mac} <-> {sta_mac}{ssid}"
+                )
+        elif hs.crackable:
+            print(
+                f"[+] Handshake {msg} captured: {ap_mac} <-> {sta_mac}{ssid} "
+                f"-- M1+M2 present, crackable"
+            )
+        else:
+            print(f"[+] Handshake {msg} captured: {ap_mac} <-> {sta_mac}{ssid}")
 
     # ------------------------------------------------------------ runtime
 
@@ -140,7 +170,7 @@ class Sniffer:
             if self.args.channels:
                 from channel_hopper import set_channel
                 set_channel(self.args.interface, self.args.channels[0])
-            print(f"[*] Channel hopping disabled (fixed channel).")
+            print("[*] Channel hopping disabled (fixed channel).")
             return
         self.hopper = ChannelHopper(
             self.args.interface,
