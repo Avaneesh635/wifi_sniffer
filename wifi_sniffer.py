@@ -6,15 +6,19 @@ Main program for the WiFi sniffer. Wires together:
   - network_db.NetworkDatabase   (AP/client/handshake tracking)
   - channel_hopper.ChannelHopper (background channel hopping)
   - packet_parsers               (802.11 frame parsing)
+  - wpa_decrypt                  (PMK/PTK/MIC for live PSK verification)
 
 Usage (requires root + a monitor-mode interface):
   sudo python3 wifi_sniffer.py -i wlan0mon
   sudo python3 wifi_sniffer.py -i wlan0mon --no-hop --channels 6
   sudo python3 wifi_sniffer.py -i wlan0mon --json out.json --timeout 120
+  sudo python3 wifi_sniffer.py -i wlan0mon --decrypt 'MyHomeNet:s3cret!'
 
 Captures WPA 4-way handshake messages (M1..M4) per AP/client pair and
-reports progress live; live PSK verification (--decrypt) is planned as
-the final part of the upgrade.
+reports progress live. With --decrypt SSID:passphrase, every captured
+M1+M2 pair for that SSID is checked against the passphrase by MIC
+comparison: correct passphrases are confirmed on the spot (works for
+WPA/WPA2-PSK only; SAE/WPA3 and 802.1X cannot be verified this way).
 """
 
 import argparse
@@ -27,6 +31,21 @@ from scapy.all import sniff
 from channel_hopper import ChannelHopper
 from network_db import NetworkDatabase
 from packet_parsers import extract_frame_info
+from wpa_decrypt import derive_pmk, derive_ptk, parse_eapol_key_bytes, verify_mic
+
+
+def parse_decrypt_args(values):
+    """
+    Parse repeated --decrypt 'SSID:passphrase' options into {ssid: pass}.
+    Splits on the FIRST colon, so the SSID may not contain a colon.
+    """
+    nets = {}
+    for value in values or []:
+        ssid, sep, passphrase = value.partition(":")
+        if not sep or not ssid:
+            raise SystemExit(f"--decrypt expects SSID:passphrase, got {value!r}")
+        nets[ssid] = passphrase
+    return nets
 
 
 class Sniffer:
@@ -41,6 +60,11 @@ class Sniffer:
         self.deauth_count = 0
         self.packet_count = 0
         self._handshake_alerted = set()  # (bssid, sta) pairs already announced
+
+        # Live passphrase verification (--decrypt)
+        self.decrypt_ssids = parse_decrypt_args(args.decrypt)  # ssid -> pass
+        self._decrypt_pmks = {}   # ssid -> PMK bytes, derived lazily
+        self._decrypt_done = {}   # (ap, sta) -> True (correct) / False (wrong)
 
     # ------------------------------------------------------------ capture
 
@@ -151,6 +175,68 @@ class Sniffer:
         else:
             print(f"[+] Handshake {msg} captured: {ap_mac} <-> {sta_mac}{ssid}")
 
+        if self.decrypt_ssids:
+            self._try_verify(hs, ap_mac, sta_mac)
+
+    # -------------------------------------------------- live verification
+
+    def _pmk_for(self, ssid: str) -> bytes:
+        """PMK for a watched SSID, derived once and cached."""
+        pmk = self._decrypt_pmks.get(ssid)
+        if pmk is None:
+            print(f"[*] Deriving PMK for '{ssid}' (PBKDF2, 4096 rounds)...")
+            pmk = derive_pmk(self.decrypt_ssids[ssid], ssid)
+            self._decrypt_pmks[ssid] = pmk
+        return pmk
+
+    def _try_verify(self, hs, ap_mac: str, sta_mac: str) -> None:
+        """
+        If the handshake for this AP/client pair now contains both an
+        ANonce (M1) and an M2 with a MIC, and we have a passphrase for
+        its SSID, test the passphrase by MIC comparison -- once per pair.
+        """
+        if ap_mac == "unknown" or sta_mac == "unknown":
+            return
+        if self._decrypt_done.get((ap_mac, sta_mac)) is not None:
+            return  # already verified / reported for this pair
+
+        ap = self.db.get_ap(ap_mac)
+        ssid = ap.ssid if ap else None
+        if not ssid or ssid not in self.decrypt_ssids:
+            return
+
+        anonce = None   # from any M1
+        msg2 = None     # first M2 carrying a MIC + raw EAPOL bytes
+        for m in hs.messages:
+            if m.get("key_msg") == "M1":
+                anonce = m.get("key_nonce")
+            if msg2 is None and m.get("key_msg") == "M2":
+                msg2 = m
+        if anonce is None or msg2 is None or not msg2.get("key_mic"):
+            return  # not enough material yet; retried on the next message
+
+        try:
+            pmk = self._pmk_for(ssid)
+            ptk = derive_ptk(
+                pmk, ap_mac, sta_mac,
+                anonce=anonce, snonce=msg2["key_nonce"],
+            )
+            eapol_key = parse_eapol_key_bytes(msg2["eapol_raw"])
+            if eapol_key is not None and verify_mic(ptk, eapol_key):
+                self._decrypt_done[(ap_mac, sta_mac)] = True
+                print(
+                    f"[+] PASSPHRASE CORRECT for '{ssid}': "
+                    f"verified on {ap_mac} <-> {sta_mac}"
+                )
+            else:
+                self._decrypt_done[(ap_mac, sta_mac)] = False
+                print(
+                    f"[-] M2 MIC mismatch for '{ssid}' "
+                    f"({ap_mac} <-> {sta_mac}): passphrase appears WRONG"
+                )
+        except (ValueError, TypeError) as exc:
+            print(f"[!] Passphrase check failed for '{ssid}': {exc}")
+
     # ------------------------------------------------------------ runtime
 
     def _display_loop(self) -> None:
@@ -189,6 +275,8 @@ class Sniffer:
     def run(self) -> None:
         signal.signal(signal.SIGINT, self._stop)
         self._start_hopper()
+        if self.decrypt_ssids:
+            print(f"[*] Will verify passphrases for: {', '.join(self.decrypt_ssids)}")
         disp = threading.Thread(target=self._display_loop, daemon=True)
         disp.start()
 
@@ -212,10 +300,33 @@ class Sniffer:
                     fh.write(self.db.to_json())
                 print(f"[*] Wrote {self.args.json}")
             print(self.db.summary())
+            self._decrypt_report()
             print(
                 f"[*] Done. packets={self.packet_count} "
                 f"eapol={self.eapol_count} deauth={self.deauth_count}"
             )
+
+    def _decrypt_report(self) -> None:
+        """Final verdict per watched SSID based on verification results."""
+        if not self.decrypt_ssids:
+            return
+        for ssid in self.decrypt_ssids:
+            results = [ok for (ap, sta), ok in self._decrypt_done.items() if ok]
+            checked = self._decrypt_done
+            watched = [k for k in checked if k[0] in self.db_summary_bssids(ssid)]
+            correct = any(ok for (ap, sta), ok in checked.items() if ok)
+            mismatch = any(not ok for (ap, sta), ok in checked.items() if not ok)
+            del results, watched  # only the aggregate flags matter here
+            if correct:
+                print(f"[=] '{ssid}': passphrase CONFIRMED by captured handshake")
+            elif mismatch:
+                print(f"[=] '{ssid}': passphrase appears INCORRECT (MIC mismatch)")
+            else:
+                print(f"[=] '{ssid}': no matching M1+M2 captured -- inconclusive")
+
+    def db_summary_bssids(self, ssid: str):
+        """BSSIDs currently known for an SSID (empty set if unknown)."""
+        return {ap.bssid for ap in self.db.aps() if ap.ssid == ssid}
 
 
 def parse_args(argv=None):
@@ -238,6 +349,11 @@ def parse_args(argv=None):
                    help="stop sniffing after N seconds")
     p.add_argument("--json", metavar="FILE",
                    help="write the network database to FILE on exit")
+    p.add_argument("--decrypt", metavar="SSID:PASSPHRASE", action="append",
+                   default=None,
+                   help="verify a WPA/WPA2-PSK passphrase live against "
+                        "captured M1+M2 handshakes (repeatable; split on "
+                        "the first colon)")
     return p.parse_args(argv)
 
 
