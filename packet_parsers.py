@@ -19,9 +19,12 @@ Handles:
     network_db can track handshakes for later decryption
   - Deauth / auth / association frame classification
   - RSSI and frequency extraction from RadioTap
+  - to-DS / from-DS direction bits plus (ap, station) endpoint
+    attribution for data/EAPOL frames, so handshake messages can be
+    filed against the correct AP/client pair
 """
 
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, Optional, Tuple
 
 from scapy.all import (
     Dot11,
@@ -40,6 +43,10 @@ from scapy.all import (
 from wpa_decrypt import parse_eapol_key_bytes
 
 FRAME_TYPES = {0: "mgmt", 1: "ctrl", 2: "data"}
+
+# Frame Control field bits (IEEE 802.11)
+FLAG_TO_DS = 0x0001
+FLAG_FROM_DS = 0x0002
 
 # RSN group cipher suite type byte -> name
 GROUP_CIPHERS = {
@@ -230,7 +237,37 @@ def eapol_key_fields(packet) -> Optional[Dict]:
     }
 
 
-# ------------------------------------------------------- frame classifier
+# ------------------------------------------------------- frame direction
+
+def direction(dot11: Dot11) -> Tuple[bool, bool]:
+    """(to_ds, from_ds) straight from the Frame Control field."""
+    fc = dot11.FCfield
+    return bool(fc & FLAG_TO_DS), bool(fc & FLAG_FROM_DS)
+
+
+def endpoints_for_data(dot11: Dot11) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve (ap_mac, sta_mac) for a data/EAPOL frame from the four
+    address fields together with the to/from-DS bits:
+
+        to_ds=1, from_ds=0  STA -> AP : addr1=BSSID, addr2=STA
+        to_ds=0, from_ds=1  AP -> STA : addr2=BSSID, addr1=STA
+        to_ds=0, from_ds=0  IBSS      : addr3=BSSID, addr2=STA
+        to_ds=1, from_ds=1  WDS 4-addr: not attributable to a single AP
+
+    Returns (None, None) when the pair cannot be determined.
+    """
+    to_ds, from_ds = direction(dot11)
+    if to_ds and not from_ds:
+        return dot11.addr1, dot11.addr2
+    if from_ds and not to_ds:
+        return dot11.addr2, dot11.addr1
+    if not to_ds and not from_ds:
+        return dot11.addr3, dot11.addr2
+    return None, None
+
+
+# ------------------------------------------------------ frame classifier
 
 def classify(packet) -> str:
     """Rough frame kind used to route processing in the main program."""
@@ -268,6 +305,7 @@ def extract_frame_info(packet) -> Optional[Dict]:
     kind = classify(packet)
     rssi = get_rssi(packet)
     freq = get_frequency(packet)
+    to_ds, from_ds = direction(dot11)
     info: Dict = {
         "kind": kind,
         "rssi": rssi,
@@ -276,6 +314,8 @@ def extract_frame_info(packet) -> Optional[Dict]:
         "addr1": dot11.addr1,
         "addr2": dot11.addr2,
         "addr3": dot11.addr3,
+        "to_ds": to_ds,
+        "from_ds": from_ds,
         "type": FRAME_TYPES.get(dot11.type, str(dot11.type)),
         "subtype": dot11.subtype,
         "ssid": None,
@@ -283,6 +323,8 @@ def extract_frame_info(packet) -> Optional[Dict]:
         "eapol": None,
         "eapol_key": None,
         "reason": None,
+        "ap": None,
+        "sta": None,
     }
 
     if kind in ("beacon", "probe_resp"):
@@ -296,9 +338,10 @@ def extract_frame_info(packet) -> Optional[Dict]:
     elif kind == "auth":
         auth = packet[Dot11Auth]
         info["alg"] = auth.algo  # 0=open, 1=shared key, 3=SAE
-    elif kind == "eapol":
-        info["eapol"] = eapol_info(packet)
-        info["bssid"] = dot11.addr3
-        info["eapol_key"] = eapol_key_fields(packet)
+    elif kind in ("data", "eapol"):
+        info["ap"], info["sta"] = endpoints_for_data(dot11)
+        if kind == "eapol":
+            info["eapol"] = eapol_info(packet)
+            info["eapol_key"] = eapol_key_fields(packet)
 
     return info
